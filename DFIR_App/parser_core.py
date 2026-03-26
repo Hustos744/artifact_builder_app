@@ -558,11 +558,31 @@ def reconstruct_hx_tree(staging_dir, raw_root, log_func=None, cancel_event=None)
 
 def find_kape_nested_root(staging_dir):
     for current_root, dirs, _ in os.walk(staging_dir):
-        if "target" not in dirs:
-            continue
-        if os.path.isdir(os.path.join(current_root, "target", "C")):
-            return current_root
-    return None
+        dirs_map = {dir_name.lower(): dir_name for dir_name in dirs}
+        for target_dir_name in ("target", "targets"):
+            target_actual_name = dirs_map.get(target_dir_name)
+            if not target_actual_name:
+                continue
+
+            target_root = os.path.join(current_root, target_actual_name)
+            try:
+                target_children = os.listdir(target_root)
+            except OSError:
+                continue
+
+            for child_name in target_children:
+                if child_name.rstrip(":").lower() == "c":
+                    return current_root, target_actual_name, child_name
+
+    for current_root, dirs, _ in os.walk(staging_dir):
+        for dir_name in dirs:
+            if dir_name.rstrip(":").lower() != "c":
+                continue
+            candidate_root = os.path.join(current_root, dir_name)
+            if os.path.isdir(os.path.join(candidate_root, "Windows")):
+                return current_root, "", dir_name
+
+    return None, "", ""
 
 
 def merge_item_into_root(source_path, destination_path):
@@ -583,9 +603,9 @@ def merge_item_into_root(source_path, destination_path):
 
 
 def prepare_kape_raw_path(staging_dir, log_func=None, cancel_event=None):
-    kape_nested_root = find_kape_nested_root(staging_dir)
+    kape_nested_root, target_dir_name, drive_dir_name = find_kape_nested_root(staging_dir)
     if not kape_nested_root:
-        raise RuntimeError("Не знайдено вкладену KAPE-структуру з target\\C")
+        raise RuntimeError("KAPE structure was not found (target/targets/C or C/).")
 
     if os.path.abspath(kape_nested_root) != os.path.abspath(staging_dir):
         if log_func:
@@ -596,9 +616,12 @@ def prepare_kape_raw_path(staging_dir, log_func=None, cancel_event=None):
             destination_item = os.path.join(staging_dir, item_name)
             merge_item_into_root(source_item, destination_item)
 
-    raw_path = os.path.join(staging_dir, "target", "C")
+    if target_dir_name:
+        raw_path = os.path.join(staging_dir, target_dir_name, drive_dir_name)
+    else:
+        raw_path = os.path.join(staging_dir, drive_dir_name)
     if not os.path.isdir(raw_path):
-        raise RuntimeError("Після flatten KAPE raw path target\\C не знайдено")
+        raise RuntimeError("KAPE raw path was not found after flatten.")
 
     if log_func:
         log_func("[+] KAPE raw path: " + raw_path)
@@ -679,6 +702,21 @@ def log_artifact_inventory(root_dir, log_func):
     )
 
 
+def resolve_executable_path(exe_path):
+    if not exe_path:
+        return ""
+
+    candidate = str(exe_path).strip()
+    if not candidate:
+        return ""
+
+    if os.path.isfile(candidate):
+        return candidate
+
+    resolved = shutil.which(candidate)
+    return resolved or ""
+
+
 def run_tool(
     exe_path,
     args_list,
@@ -689,17 +727,18 @@ def run_tool(
     log_stdout_on_success=False,
     cancel_event=None,
 ):
-    if not exe_path or not os.path.isfile(exe_path):
+    resolved_exe = resolve_executable_path(exe_path)
+    if not resolved_exe:
         if log_func:
-            log_func("[!] Виконуваний файл не знайдено: " + str(exe_path))
+            log_func("[!] Executable not found: " + str(exe_path))
         return False
 
     try:
         if requires_admin and os.name == "nt" and not is_running_as_admin():
             if log_func:
-                log_func("[*] Запускаю інструмент через прихований admin broker: " + os.path.basename(exe_path))
+                log_func("[*] Starting tool via hidden admin broker: " + os.path.basename(resolved_exe))
             return run_tool_via_admin_broker(
-                exe_path=exe_path,
+                exe_path=resolved_exe,
                 args_list=args_list,
                 log_func=log_func,
                 cwd=cwd,
@@ -710,7 +749,7 @@ def run_tool(
 
         if requires_console:
             if log_func:
-                log_func("[*] Запускаю інструмент у режимі з окремою консоллю: " + os.path.basename(exe_path))
+                log_func("[*] Starting tool in separate console mode: " + os.path.basename(resolved_exe))
             startupinfo = None
             creationflags = 0
             if os.name == "nt":
@@ -719,7 +758,7 @@ def run_tool(
                 startupinfo.wShowWindow = 0
                 creationflags = CREATE_NEW_CONSOLE
             process = subprocess.Popen(
-                [exe_path] + args_list,
+                [resolved_exe] + args_list,
                 cwd=cwd,
                 startupinfo=startupinfo,
                 creationflags=creationflags,
@@ -732,7 +771,7 @@ def run_tool(
             result = process
         else:
             process = subprocess.Popen(
-                [exe_path] + args_list,
+                [resolved_exe] + args_list,
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -764,13 +803,13 @@ def run_tool(
                         log_func("[!] STDERR: " + line)
 
         if result.returncode != 0 and log_func:
-            log_func("[!] Інструмент завершився з кодом " + str(result.returncode))
+            log_func("[!] Tool exited with code " + str(result.returncode))
         return result.returncode == 0
     except CancelledError:
         raise
     except Exception as exc:
         if log_func:
-            log_func("[!] Виняток під час запуску: " + str(exc))
+            log_func("[!] Exception while starting tool: " + str(exc))
         return False
 
 
@@ -939,7 +978,7 @@ def run_hayabusa(raw_path, csv_root, config, log_func=None, cancel_event=None):
     event_dir = build_artifact_path(raw_path, "windows/system32/winevt/logs")
     if not os.path.isdir(event_dir):
         if log_func:
-            log_func("[!] Директорію Windows Event Logs не знайдено за очікуваним шляхом. Пропускаю.")
+            log_func("[!] Windows Event Logs directory was not found at the expected path. Skipping.")
         return True
 
     hayabusa_exe = config.get("Hayabusa", "")
@@ -948,25 +987,47 @@ def run_hayabusa(raw_path, csv_root, config, log_func=None, cancel_event=None):
     hayabusa_cwd = os.path.dirname(hayabusa_exe) or None
 
     if log_func:
-        log_func("[+] Знайдено Windows Event Logs: " + event_dir)
+        log_func("[+] Found Windows Event Logs: " + event_dir)
 
-    csv_ok = run_tool(
-        hayabusa_exe,
+    csv_variants = [
         ["csv-timeline", "-w", "-q", "-d", event_dir, "-o", csv_output],
-        log_func=log_func,
-        cwd=hayabusa_cwd,
-        cancel_event=cancel_event,
-    )
+        ["csv-timeline", "-w", "-d", event_dir, "-o", csv_output],
+        ["csv-timeline", "-d", event_dir, "-o", csv_output],
+    ]
+    csv_ok = False
+    for index, csv_args in enumerate(csv_variants):
+        if index > 0 and log_func:
+            log_func("[*] Hayabusa CSV fallback #" + str(index))
+        csv_ok = run_tool(
+            hayabusa_exe,
+            csv_args,
+            log_func=log_func,
+            cwd=hayabusa_cwd,
+            cancel_event=cancel_event,
+        )
+        if csv_ok:
+            break
     if not csv_ok:
         return False
 
-    json_ok = run_tool(
-        hayabusa_exe,
+    json_variants = [
         ["json-timeline", "-L", "-w", "-p", "verbose", "-d", event_dir, "-o", json_output],
-        log_func=log_func,
-        cwd=hayabusa_cwd,
-        cancel_event=cancel_event,
-    )
+        ["json-timeline", "-w", "-p", "verbose", "-d", event_dir, "-o", json_output],
+        ["json-timeline", "-d", event_dir, "-o", json_output],
+    ]
+    json_ok = False
+    for index, json_args in enumerate(json_variants):
+        if index > 0 and log_func:
+            log_func("[*] Hayabusa JSON fallback #" + str(index))
+        json_ok = run_tool(
+            hayabusa_exe,
+            json_args,
+            log_func=log_func,
+            cwd=hayabusa_cwd,
+            cancel_event=cancel_event,
+        )
+        if json_ok:
+            break
     if not json_ok:
         return False
 
@@ -1122,8 +1183,7 @@ def run_srum_dump(raw_path, csv_root, config, log_func=None, cancel_event=None):
         )
         if not config_ready:
             if log_func:
-                log_func("[!] Не вдалося підготувати srum_dump_config.json для source mode.")
-            return False
+                log_func("[!] Could not prepare srum_dump_config.json. Continuing without pre-seed.")
 
         args = runtime["prefix_args"] + [
             "--SRUM_INFILE",
